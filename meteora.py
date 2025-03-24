@@ -16,7 +16,10 @@ logging.basicConfig(
     handlers=[logging.FileHandler('meteora_analytics.log')]
 )
 
-RPC_URL = "$RPC_URL"
+RPC_URL = os.environ.get("RPC_URL")
+if not RPC_URL:
+    # Check for required variables
+    raise ValueError("RPC_URL environment variable is not set!")
 METEORA_PROGRAM_ID = Pubkey.from_string("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo")
 CNFT_MINT = "Cw4DD54N14aNNaRdhBCq7W9QQh8Bat812VuFbXbLC8bH"  # Changed to string
 BLACKLIST_FILE = "kelsier_addresses.csv"
@@ -41,7 +44,10 @@ def load_blacklist() -> set:
 def check_cnft(wallet_address: str) -> bool:
     """Check cNFT ownership using Helius DAS API"""
     try:
-        HELIUS_API_KEY = "$HELIUS_API_KEY"
+        HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY")
+        # Check for required variables
+        if not HELIUS_API_KEY:
+            raise ValueError("HELIUS_API_KEY environment variable is not set!")
         url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
         payload = {
