@@ -1,4 +1,4 @@
-# lp-army-wallet-metrics
+# meteora-wallet-metrics
 Soft for analysis activity in meteora.ag
 ### What can this script do?
 - Show Meteora related wallet parameters that may be of interest to LP Army Community:
