@@ -1,5 +1,27 @@
 # meteora-wallet-analysis
 Soft for analysis activity in meteora.ag
+### What can this script do?
+- Show Meteora related wallet parameters that may be of interest to LP Army Community:
+```
+1 Wallet:
+9BY...NHR
+💵 Total fees claimed: $135.71
+🛀 Pools with claimed fees: 12
+🗓 First tx: 22.12.2024
+📅 Number of active weeks: 11
+📅 Number of active months: 3
+🖼 LP Army Certificate сNFT: Yes
+🚫 Blacklist kelsier_addresses: No
+```
+- There are 3 options for presenting analytics to choose from:
+```
+ Choose output format:
+1. CSV file
+2. Text report
+3. Both formats
+Enter your choice (1-3): # Enter the number
+```
+- You can check several wallets at once. Enter them separated by a space.
 <img width="843" alt="image" src="https://github.com/user-attachments/assets/a794e3ed-c2f6-4604-b79a-5412fb5a4c24" />
 
 ### 1) You need to create [Quicknode](https://dashboard.quicknode.com/) and [Helius](https://dashboard.helius.dev/) keys:
@@ -66,4 +88,12 @@ Choose output format:
 3. Both formats
 ```
 CSV file is generated in the folder with the script.
+
+Text Result:
+
+![Снимок экрана 2025-03-25 135341111](https://github.com/user-attachments/assets/88857d8f-c2e3-425b-8cf7-56441072633b)
+
+CSV file:
+
+![image](https://github.com/user-attachments/assets/a2220ae4-e82b-4362-b4f3-084a535a31fc)
 
