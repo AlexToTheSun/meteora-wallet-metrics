@@ -1,7 +1,7 @@
 # meteora-wallet-metrics
 Soft for analysis activity in meteora.ag
 ### What can this script do?
-- Show Meteora related wallet parameters that may be of interest to LP Army Community:
+- Shows Meteora wallet parameters that may be of interest to the LP Army community:
 ```
 1 Wallet:
 9BY...NHR
@@ -97,3 +97,7 @@ CSV file:
 
 ![image](https://github.com/user-attachments/assets/a2220ae4-e82b-4362-b4f3-084a535a31fc)
 
+### To contact us
+Discord: alexturetskiy
+Twitter: https://twitter.com/Alex007hi
+Telegram: https://t.me/AlexTuretskiy
