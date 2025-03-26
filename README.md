@@ -23,11 +23,11 @@ CSV report generated: Meteora_20250325_0.csv
 ```
 ## Overview
 In this tutorial
-- [What can this script do?](https://github.com/AlexToTheSun/meteora-wallet-metrics/tree/main#what-can-this-script-do)
-- [1) Create Quicknode and Helius keys](https://github.com/AlexToTheSun/meteora-wallet-metrics/tree/main#1-create-quicknode-and-helius-keys.)
-- [2) Installation](https://github.com/AlexToTheSun/meteora-wallet-metrics/tree/main/README.md#2-installation)
-- [Auto install script if you use Ubuntu](https://github.com/AlexToTheSun/meteora-wallet-metrics/tree/main/README.md#auto-install-script-if-you-use-ubuntu)
-- [To contact us](https://github.com/AlexToTheSun/meteora-wallet-metrics/tree/main/README.md#to-contact-us)
+- [What can this script do?](https://github.com/AlexToTheSun/meteora-wallet-metrics/blob/main#what-can-this-script-do)
+- [1) Create Quicknode and Helius keys](https://github.com/AlexToTheSun/meteora-wallet-metrics/blob/main/README.md#1-create-quicknode-and-helius-keys)
+- [2) Installation](https://github.com/AlexToTheSun/meteora-wallet-metrics/blob/main/README.md#2-installation)
+- [Auto install script if you use Ubuntu](https://github.com/AlexToTheSun/meteora-wallet-metrics/blob/main/README.md#auto-install-script-if-you-use-ubuntu)
+- [To contact us](https://github.com/AlexToTheSun/meteora-wallet-metrics/blob/main/README.md#to-contact-us)
 
 ### What can this script do?
 
