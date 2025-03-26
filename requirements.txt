@@ -1,0 +1,8 @@
+aiogram==2.23.1
+aiohttp
+cachetools
+requests
+requests-cache
+python-dotenv
+solana
+solders
