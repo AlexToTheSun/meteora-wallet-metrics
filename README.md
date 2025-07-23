@@ -33,6 +33,21 @@ The bot has several significant improvements.
    - Tracks which API endpoints each user is using
    - Rotates through available endpoints when a user makes multiple requests
 
+## Running
+1. Install Python dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. Export your Telegram token and prepare RPC/Helius endpoint files.
+3. Start the bot:
+   ```bash
+   python meteora-telegram-bot-v3.py
+   ```
+
+Wallet metrics are cached locally using SQLite (`wallet_metrics.db`).
+You can swap this with an external database by modifying `database.py`
+and running the database as a Docker service if required for higher load.
+
 
 ## To contact us
 Discord: `alexturetskiy`

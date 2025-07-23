@@ -1,10 +1,10 @@
 import logging
 import os
 import sys
-import requests
 import csv
 import asyncio
-import concurrent.futures
+import aiohttp
+import json
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
@@ -12,6 +12,8 @@ from solana.rpc.api import Client
 from solders.pubkey import Pubkey
 from solders.signature import Signature
 from solders.transaction_status import UiPartiallyDecodedInstruction
+
+from database import init_db, get_wallet_metrics, store_wallet_metrics
 
 # Setting up logging
 logging.basicConfig(
@@ -302,14 +304,10 @@ class WalletProcessor:
                 }
                 
                 debug_log("Sending request to Helius API")
-                # Make the request with increased timeout and retry logic
-                session = requests.Session()
-                adapter = requests.adapters.HTTPAdapter(max_retries=3)
-                session.mount('https://', adapter)
-                response = session.post(url, json=payload, timeout=30)
-                response.raise_for_status()
-                
-                data = response.json()
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload, timeout=30) as response:
+                        response.raise_for_status()
+                        data = await response.json()
                 debug_log("Received response from Helius API")
                 
                 # Debug log the full response structure for the first item if available
@@ -457,7 +455,7 @@ class WalletProcessor:
                 debug_log(f"No Meteora LP Army Certificate cNFT found after checking {items_count} assets")
                 break  # Exit retry loop if we got a valid response
                 
-            except requests.exceptions.RequestException as re:
+            except aiohttp.ClientError as re:
                 debug_log(f"Request error: {str(re)}")
                 retry_count += 1
                 await asyncio.sleep(2 * retry_count)
@@ -485,15 +483,21 @@ class WalletProcessor:
         task.start()
         
         try:
-            client = Client(self.rpc_url)
-            wallet_pubkey = Pubkey.from_string(self.wallet_address)
-            response = client.get_signatures_for_address(
-                wallet_pubkey,
-                limit=1000,
-                commitment="confirmed"
-            )
-            
-            self.transactions = [(sig.signature, sig.block_time) for sig in response.value if sig.block_time]
+            def _fetch():
+                client = Client(self.rpc_url)
+                wallet_pubkey = Pubkey.from_string(self.wallet_address)
+                return client.get_signatures_for_address(
+                    wallet_pubkey,
+                    limit=1000,
+                    commitment="confirmed",
+                )
+
+            response = await asyncio.to_thread(_fetch)
+            self.transactions = [
+                (sig.signature, sig.block_time)
+                for sig in response.value
+                if sig.block_time
+            ]
             task.update(len(self.transactions))
             task.complete()
         except Exception as e:
@@ -509,11 +513,12 @@ class WalletProcessor:
         
         client = Client(self.rpc_url)
         self.meteora_transactions = []
-        
+
         try:
             for index, (sig, timestamp) in enumerate(self.transactions, 1):
                 try:
-                    tx = client.get_transaction(sig, encoding="jsonParsed").value
+                    tx_resp = await asyncio.to_thread(client.get_transaction, sig, encoding="jsonParsed")
+                    tx = tx_resp.value if tx_resp else None
                     if not tx:
                         continue
 
@@ -593,7 +598,8 @@ class WalletProcessor:
         try:
             for index, (sig, _) in enumerate(self.meteora_transactions, 1):
                 try:
-                    tx = client.get_transaction(sig, encoding="jsonParsed").value
+                    tx_resp = await asyncio.to_thread(client.get_transaction, sig, encoding="jsonParsed")
+                    tx = tx_resp.value if tx_resp else None
 
                     if not tx:
                         continue
@@ -628,26 +634,27 @@ class WalletProcessor:
         task.start(len(self.pool_addresses))
         
         try:
-            for index, pool in enumerate(self.pool_addresses, 1):
-                try:
-                    response = requests.get(
-                        f"https://dlmm-api.meteora.ag/wallet/{self.wallet_address}/{pool}/earning",
-                        timeout=10
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                    
-                    fees = float(data.get("total_fee_usd_claimed", 0.0))
-                    self.result['total_fees'] += fees
-                    if fees >= 0.01:
-                        self.result['pools_with_fees'] += 1
-                except Exception as e:
-                    logging.error(f"Failed to get fees for {pool}: {str(e)}")
-                
-                # Update progress
-                task.update(index)
-                if index % 2 == 0 or index == len(self.pool_addresses):  # Update every 2 pools or at the end
-                    await self.update_progress()
+            async with aiohttp.ClientSession() as session:
+                for index, pool in enumerate(self.pool_addresses, 1):
+                    try:
+                        async with session.get(
+                            f"https://dlmm-api.meteora.ag/wallet/{self.wallet_address}/{pool}/earning",
+                            timeout=10,
+                        ) as response:
+                            response.raise_for_status()
+                            data = await response.json()
+
+                        fees = float(data.get("total_fee_usd_claimed", 0.0))
+                        self.result['total_fees'] += fees
+                        if fees >= 0.01:
+                            self.result['pools_with_fees'] += 1
+                    except Exception as e:
+                        logging.error(f"Failed to get fees for {pool}: {str(e)}")
+
+                    # Update progress
+                    task.update(index)
+                    if index % 2 == 0 or index == len(self.pool_addresses):
+                        await self.update_progress()
             
             task.complete()
             await self.update_progress()
@@ -659,7 +666,13 @@ class WalletProcessor:
     async def process(self):
         """Process wallet and return results"""
         logging.info(f"Processing wallet: {self.wallet_address}")
-        
+
+        cached = await get_wallet_metrics(self.wallet_address)
+        if cached:
+            logging.info(f"Using cached data for {self.wallet_address}")
+            self.result.update(cached)
+            return self.result
+
         # Process wallet in correct sequence
         await self.check_blacklist()
         await self.check_cnft()
@@ -669,7 +682,9 @@ class WalletProcessor:
         await self.calculate_activity_metrics()
         await self.extract_pool_addresses()
         await self.get_pool_fees()
-        
+
+        await store_wallet_metrics(self.wallet_address, self.result)
+
         return self.result
 
 
@@ -925,6 +940,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 def main() -> None:
     """Start the bot."""
+    # Initialize local database
+    asyncio.run(init_db())
+
     # Create the Application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
