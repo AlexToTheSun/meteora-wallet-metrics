@@ -1,7 +1,13 @@
+aiosqlite
+python-telegram-bot==20.7
 aiogram==2.23.1
 aiohttp
-aiosqlite
 cachetools
+requests==2.31.0
+requests-cache
 python-dotenv
 solana
 solders
+base58==2.1.1
+asyncio-throttle==1.0.2
+pytz==2023.3
