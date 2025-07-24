@@ -1,19 +1,21 @@
 import logging
 import os
 import sys
+import requests
 import csv
 import asyncio
-import aiohttp
-import json
+import concurrent.futures
 from datetime import datetime
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from contextlib import contextmanager
+import json
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from solana.rpc.api import Client
 from solders.pubkey import Pubkey
 from solders.signature import Signature
 from solders.transaction_status import UiPartiallyDecodedInstruction
-
-from database import init_db, get_wallet_metrics, store_wallet_metrics
 
 # Setting up logging
 logging.basicConfig(
@@ -26,8 +28,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Environment variables and API file handling
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+# Environment variables
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+
+# Database configuration
+DB_CONFIG = {
+    'host': os.environ.get('DB_HOST', 'postgres'),
+    'port': os.environ.get('DB_PORT', '5432'),
+    'database': os.environ.get('DB_NAME', 'meteora_bot'),
+    'user': os.environ.get('DB_USER', 'meteora'),
+    'password': os.environ.get('DB_PASSWORD', 'meteora_password')
+}
 
 # Function to load API endpoints from files
 def load_api_endpoints(filename):
@@ -69,88 +80,178 @@ HELIUS_API_KEYS = load_api_endpoints("HELIUS_API_KEY.txt")
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN environment variable is not set!")
 
+# Constants
+METEORA_PROGRAM_ID = Pubkey.from_string("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo")
+CNFT_CREATOR_ADDRESS = "BC11Rk2ZoLxb7tjSpycXDyHnyTdYeaYMgbMwimh8DThX"
+CNFT_NAME_MATCH = "Meteora LP Army Certificate"
+BLACKLIST_URL = "https://raw.githubusercontent.com/MeteoraAg/ops/refs/heads/main/kelsier_addresses.csv"
+
+# Database Manager
+class DatabaseManager:
+    def __init__(self):
+        self.init_database()
+    
+    @contextmanager
+    def get_connection(self):
+        """Context manager for database connections"""
+        conn = psycopg2.connect(**DB_CONFIG)
+        try:
+            yield conn
+        finally:
+            conn.close()
+    
+    def init_database(self):
+        """Initialize database tables"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Create tables
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS blacklist (
+                        address VARCHAR(255) PRIMARY KEY,
+                        reason TEXT,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS api_usage (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        api_type VARCHAR(50) NOT NULL,
+                        api_index INTEGER NOT NULL,
+                        used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS processing_tasks (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        task_id VARCHAR(255) UNIQUE NOT NULL,
+                        status VARCHAR(50) NOT NULL,
+                        wallets TEXT NOT NULL,
+                        results TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_api_usage_user_id ON api_usage(user_id);
+                """)
+                
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_processing_tasks_user_id ON processing_tasks(user_id);
+                """)
+                
+                conn.commit()
+                logger.info("Database initialized successfully")
+    
+    def update_blacklist(self):
+        """Update blacklist from remote source"""
+        try:
+            response = requests.get(BLACKLIST_URL, timeout=30)
+            response.raise_for_status()
+            
+            # Parse CSV content
+            csv_content = response.text.splitlines()
+            reader = csv.DictReader(csv_content)
+            
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Clear existing blacklist
+                    cur.execute("TRUNCATE TABLE blacklist")
+                    
+                    # Insert new data
+                    for row in reader:
+                        cur.execute(
+                            "INSERT INTO blacklist (address, reason) VALUES (%s, %s)",
+                            (row['address'].strip(), row.get('reason', '').strip())
+                        )
+                    
+                    conn.commit()
+                    logger.info("Blacklist updated successfully")
+        except Exception as e:
+            logger.error(f"Failed to update blacklist: {str(e)}")
+    
+    def is_blacklisted(self, address):
+        """Check if address is blacklisted"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT EXISTS(SELECT 1 FROM blacklist WHERE address = %s)",
+                    (address,)
+                )
+                return cur.fetchone()[0]
+    
+    def get_user_api_indices(self, user_id):
+        """Get least recently used API indices for user"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get least recently used RPC
+                cur.execute("""
+                    WITH usage_counts AS (
+                        SELECT api_index, MAX(used_at) as last_used
+                        FROM api_usage
+                        WHERE api_type = 'rpc'
+                        GROUP BY api_index
+                    )
+                    SELECT COALESCE(
+                        (SELECT api_index FROM usage_counts ORDER BY last_used LIMIT 1),
+                        0
+                    ) as rpc_index
+                """)
+                rpc_index = cur.fetchone()[0]
+                
+                # Get least recently used Helius key
+                cur.execute("""
+                    WITH usage_counts AS (
+                        SELECT api_index, MAX(used_at) as last_used
+                        FROM api_usage
+                        WHERE api_type = 'helius'
+                        GROUP BY api_index
+                    )
+                    SELECT COALESCE(
+                        (SELECT api_index FROM usage_counts ORDER BY last_used LIMIT 1),
+                        0
+                    ) as helius_index
+                """)
+                helius_index = cur.fetchone()[0]
+                
+                # Record usage
+                cur.execute(
+                    "INSERT INTO api_usage (user_id, api_type, api_index) VALUES (%s, %s, %s), (%s, %s, %s)",
+                    (user_id, 'rpc', rpc_index, user_id, 'helius', helius_index)
+                )
+                conn.commit()
+                
+                return rpc_index % len(RPC_URLS), helius_index % len(HELIUS_API_KEYS)
+
+# Initialize database
+db_manager = DatabaseManager()
+
+# Update blacklist on startup
+db_manager.update_blacklist()
+
+# Schedule periodic blacklist updates (every 6 hours)
+async def periodic_blacklist_update():
+    while True:
+        await asyncio.sleep(6 * 60 * 60)  # 6 hours
+        db_manager.update_blacklist()
+
 # API endpoint management
 class APIManager:
-    def __init__(self, rpc_urls, helius_api_keys):
-        self.rpc_urls = rpc_urls
-        self.helius_api_keys = helius_api_keys
-        self.user_counters = {}  # {user_id: (rpc_index, helius_index)}
-        self.last_used = {}  # {key: timestamp} to track usage and avoid rate limits
+    def __init__(self):
+        self.rpc_urls = RPC_URLS
+        self.helius_api_keys = HELIUS_API_KEYS
     
     def get_endpoints_for_user(self, user_id):
         """Get RPC URL and Helius API key for a specific user"""
-        current_time = datetime.now().timestamp()
-        
-        if user_id not in self.user_counters:
-            # First request from this user, assign the next available endpoints
-            # Choose endpoints that haven't been used recently
-            rpc_index = self._get_least_used_index(self.rpc_urls)
-            helius_index = self._get_least_used_index(self.helius_api_keys)
-            self.user_counters[user_id] = (rpc_index, helius_index)
-        else:
-            # Get indices for this user
-            rpc_index, helius_index = self.user_counters[user_id]
-            
-            # For subsequent calls, rotate to avoid rate limits
-            rpc_index = (rpc_index + 1) % len(self.rpc_urls)
-            helius_index = (helius_index + 1) % len(self.helius_api_keys)
-            self.user_counters[user_id] = (rpc_index, helius_index)
-        
-        # Update last used timestamp
-        rpc_key = f"rpc_{rpc_index}"
-        helius_key = f"helius_{helius_index}" 
-        self.last_used[rpc_key] = current_time
-        self.last_used[helius_key] = current_time
-        
+        rpc_index, helius_index = db_manager.get_user_api_indices(user_id)
         return self.rpc_urls[rpc_index], self.helius_api_keys[helius_index]
-    
-    def _get_least_used_index(self, endpoint_list):
-        """Get index of least recently used endpoint"""
-        min_time = float('inf')
-        min_index = 0
-        
-        for i in range(len(endpoint_list)):
-            key = f"{'rpc' if endpoint_list == self.rpc_urls else 'helius'}_{i}"
-            last_used_time = self.last_used.get(key, 0)
-            
-            if last_used_time < min_time:
-                min_time = last_used_time
-                min_index = i
-        
-        return min_index
-    
-    def release_user(self, user_id):
-        """Remove user from tracking when processing is complete"""
-        if user_id in self.user_counters:
-            del self.user_counters[user_id]
 
 # Create global API manager
-api_manager = APIManager(RPC_URLS, HELIUS_API_KEYS)
-
-# Constants
-METEORA_PROGRAM_ID = Pubkey.from_string("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo")
-CNFT_CREATOR_ADDRESS = "BC11Rk2ZoLxb7tjSpycXDyHnyTdYeaYMgbMwimh8DThX"  # Address of the creator
-CNFT_NAME_MATCH = "Meteora LP Army Certificate"  # Name to match for cNFT
-BLACKLIST_FILE = "kelsier_addresses.csv"
-
-# Load blacklist
-def load_blacklist() -> set:
-    """Load blacklisted addresses from CSV"""
-    blacklist = set()
-    try:
-        if os.path.exists(BLACKLIST_FILE):
-            with open(BLACKLIST_FILE, 'r') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    blacklist.add(row['address'].strip())
-        else:
-            logging.warning(f"Blacklist file {BLACKLIST_FILE} not found")
-    except Exception as e:
-        logging.error(f"Error loading blacklist: {str(e)}")
-    return blacklist
-
-# Global blacklist to avoid reloading for every request
-BLACKLIST = load_blacklist()
+api_manager = APIManager()
 
 # Task tracking for progress reporting
 class TaskProgress:
@@ -201,7 +302,7 @@ class WalletProcessor:
         
         # Get API endpoints for this user
         self.rpc_url, self.helius_api_key = api_manager.get_endpoints_for_user(user_id)
-        logging.info(f"Using RPC URL index {api_manager.user_counters[user_id][0]} and Helius API key index {api_manager.user_counters[user_id][1]} for user {user_id}")
+        logging.info(f"User {user_id}: Using RPC URL and Helius API key")
         
         # Initialize tasks
         self.tasks = {
@@ -256,7 +357,7 @@ class WalletProcessor:
         task.start()
         
         try:
-            self.result['blacklist'] = self.wallet_address in BLACKLIST
+            self.result['blacklist'] = db_manager.is_blacklisted(self.wallet_address)
             task.complete()
         except Exception as e:
             logging.error(f"Blacklist check error for {self.wallet_address}: {str(e)}")
@@ -304,20 +405,15 @@ class WalletProcessor:
                 }
                 
                 debug_log("Sending request to Helius API")
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(url, json=payload, timeout=30) as response:
-                        response.raise_for_status()
-                        data = await response.json()
-                debug_log("Received response from Helius API")
+                # Make the request with increased timeout and retry logic
+                session = requests.Session()
+                adapter = requests.adapters.HTTPAdapter(max_retries=3)
+                session.mount('https://', adapter)
+                response = session.post(url, json=payload, timeout=30)
+                response.raise_for_status()
                 
-                # Debug log the full response structure for the first item if available
-                if "result" in data and "items" in data["result"] and len(data["result"]["items"]) > 0:
-                    first_item = data["result"]["items"][0]
-                    debug_log(f"First item structure: {first_item.keys()}")
-                    if "content" in first_item and "metadata" in first_item["content"]:
-                        debug_log(f"First item content.metadata structure: {first_item['content']['metadata'].keys()}")
-                    if "creators" in first_item:
-                        debug_log(f"First item creators structure: {first_item['creators']}")
+                data = response.json()
+                debug_log("Received response from Helius API")
                 
                 # Check for error in response
                 if "error" in data:
@@ -328,14 +424,8 @@ class WalletProcessor:
                     continue
                 
                 # Check if there's valid result data
-                if "result" not in data:
-                    debug_log("Missing 'result' in API response")
-                    retry_count += 1
-                    await asyncio.sleep(2 * retry_count)
-                    continue
-                    
-                if "items" not in data["result"]:
-                    debug_log("Missing 'items' in API response result")
+                if "result" not in data or "items" not in data["result"]:
+                    debug_log("Missing data in API response")
                     retry_count += 1
                     await asyncio.sleep(2 * retry_count)
                     continue
@@ -345,75 +435,22 @@ class WalletProcessor:
                 items_count = len(items)
                 debug_log(f"Found {items_count} assets")
                 
-                # Much more thorough search implementation
+                # Search for the certificate
                 for i, item in enumerate(items):
-                    # Log progress for every 100 items to avoid excessive logging
-                    if i % 100 == 0:
-                        debug_log(f"Processing item {i}/{items_count}")
-                    
-                    # Initialize check variables for this item
+                    # Check creator
                     creator_found = False
-                    name_match = False
-                    
-                    # Check creator in multiple potential locations
-                    creator_locations = [
-                        "creators",  # Standard location from your example
-                        "content.creators",  # Alternative location
-                        "ownership.creators"  # Another possible location
-                    ]
-                    
-                    # For the standard location
                     if "creators" in item:
                         for creator in item["creators"]:
                             if isinstance(creator, dict) and creator.get("address") == CNFT_CREATOR_ADDRESS:
                                 creator_found = True
-                                debug_log(f"Item {i}: Found creator match at standard location")
                                 break
                     
-                    # For content.creators
-                    if not creator_found and "content" in item and "creators" in item["content"]:
-                        for creator in item["content"]["creators"]:
-                            if isinstance(creator, dict) and creator.get("address") == CNFT_CREATOR_ADDRESS:
-                                creator_found = True
-                                debug_log(f"Item {i}: Found creator match at content.creators")
-                                break
-                    
-                    # Check name in multiple potential locations
-                    name_locations = [
-                        "content.metadata.name",  # Standard location from your example
-                        "name",  # Direct item name
-                        "content.name"  # Another possible location
-                    ]
-                    
-                    # Check standard location
+                    # Check name
+                    name_match = False
                     if "content" in item and "metadata" in item["content"] and "name" in item["content"]["metadata"]:
                         nft_name = item["content"]["metadata"]["name"]
                         if CNFT_NAME_MATCH in nft_name:
                             name_match = True
-                            debug_log(f"Item {i}: Found name match '{nft_name}' at content.metadata.name")
-                    
-                    # Check direct name
-                    if not name_match and "name" in item:
-                        nft_name = item["name"]
-                        if CNFT_NAME_MATCH in nft_name:
-                            name_match = True
-                            debug_log(f"Item {i}: Found name match '{nft_name}' at direct name")
-                    
-                    # Check content.name
-                    if not name_match and "content" in item and "name" in item["content"]:
-                        nft_name = item["content"]["name"]
-                        if CNFT_NAME_MATCH in nft_name:
-                            name_match = True
-                            debug_log(f"Item {i}: Found name match '{nft_name}' at content.name")
-                    
-                    # Log detailed info about promising items
-                    if creator_found or name_match:
-                        debug_log(f"Potential match at item {i} - Creator match: {creator_found}, Name match: {name_match}")
-                        # Log more details about this item for debugging
-                        if creator_found and not name_match:
-                            debug_log(f"Item with creator but no name match: {item}")
-                        if name_match and not creator_found:
-                            debug_log(f"Item with name match but no creator: {item}")
                     
                     # Check if we found both criteria
                     if creator_found and name_match:
@@ -422,40 +459,11 @@ class WalletProcessor:
                         task.complete()
                         await self.update_progress()
                         return
-                    
-                    # Important: For this specific case, let's try a more lenient approach
-                    # If we find just the creator match, let's also consider the item further
-                    if creator_found:
-                        debug_log(f"Found creator match at item {i} - checking more details")
-                        # Log the complete item for analysis
-                        debug_log(f"Complete item details: {item}")
-                        
-                        # Special case: Check if the item has ANY Meteora-related identifier
-                        if "content" in item:
-                            content_str = str(item["content"]).lower()
-                            if "meteora" in content_str:
-                                debug_log(f"Item {i} contains 'meteora' in content - marking as match")
-                                self.result['cnft'] = True
-                                task.complete()
-                                await self.update_progress()
-                                return
-                
-                # Special emergency fallback - if creator matches at all, assume it's the certificate
-                # This is only a last resort method since we're having issues with detection
-                for i, item in enumerate(items):
-                    if "creators" in item:
-                        for creator in item["creators"]:
-                            if isinstance(creator, dict) and creator.get("address") == CNFT_CREATOR_ADDRESS:
-                                debug_log(f"FALLBACK: Found creator match at item {i} - assuming this is the certificate")
-                                self.result['cnft'] = True
-                                task.complete()
-                                await self.update_progress()
-                                return
                 
                 debug_log(f"No Meteora LP Army Certificate cNFT found after checking {items_count} assets")
                 break  # Exit retry loop if we got a valid response
                 
-            except aiohttp.ClientError as re:
+            except requests.exceptions.RequestException as re:
                 debug_log(f"Request error: {str(re)}")
                 retry_count += 1
                 await asyncio.sleep(2 * retry_count)
@@ -468,12 +476,7 @@ class WalletProcessor:
                 retry_count += 1
                 await asyncio.sleep(2 * retry_count)
         
-        # Complete the task regardless of outcome
-        if self.result['cnft']:
-            debug_log("Completed with cNFT found")
-        else:
-            debug_log("Completed with no cNFT found")
-        
+        # Complete the task
         task.complete() if retry_count < max_retries else task.fail()
         await self.update_progress()
     
@@ -483,21 +486,15 @@ class WalletProcessor:
         task.start()
         
         try:
-            def _fetch():
-                client = Client(self.rpc_url)
-                wallet_pubkey = Pubkey.from_string(self.wallet_address)
-                return client.get_signatures_for_address(
-                    wallet_pubkey,
-                    limit=1000,
-                    commitment="confirmed",
-                )
-
-            response = await asyncio.to_thread(_fetch)
-            self.transactions = [
-                (sig.signature, sig.block_time)
-                for sig in response.value
-                if sig.block_time
-            ]
+            client = Client(self.rpc_url)
+            wallet_pubkey = Pubkey.from_string(self.wallet_address)
+            response = client.get_signatures_for_address(
+                wallet_pubkey,
+                limit=1000,
+                commitment="confirmed"
+            )
+            
+            self.transactions = [(sig.signature, sig.block_time) for sig in response.value if sig.block_time]
             task.update(len(self.transactions))
             task.complete()
         except Exception as e:
@@ -513,12 +510,11 @@ class WalletProcessor:
         
         client = Client(self.rpc_url)
         self.meteora_transactions = []
-
+        
         try:
             for index, (sig, timestamp) in enumerate(self.transactions, 1):
                 try:
-                    tx_resp = await asyncio.to_thread(client.get_transaction, sig, encoding="jsonParsed")
-                    tx = tx_resp.value if tx_resp else None
+                    tx = client.get_transaction(sig, encoding="jsonParsed").value
                     if not tx:
                         continue
 
@@ -598,8 +594,7 @@ class WalletProcessor:
         try:
             for index, (sig, _) in enumerate(self.meteora_transactions, 1):
                 try:
-                    tx_resp = await asyncio.to_thread(client.get_transaction, sig, encoding="jsonParsed")
-                    tx = tx_resp.value if tx_resp else None
+                    tx = client.get_transaction(sig, encoding="jsonParsed").value
 
                     if not tx:
                         continue
@@ -634,27 +629,26 @@ class WalletProcessor:
         task.start(len(self.pool_addresses))
         
         try:
-            async with aiohttp.ClientSession() as session:
-                for index, pool in enumerate(self.pool_addresses, 1):
-                    try:
-                        async with session.get(
-                            f"https://dlmm-api.meteora.ag/wallet/{self.wallet_address}/{pool}/earning",
-                            timeout=10,
-                        ) as response:
-                            response.raise_for_status()
-                            data = await response.json()
-
-                        fees = float(data.get("total_fee_usd_claimed", 0.0))
-                        self.result['total_fees'] += fees
-                        if fees >= 0.01:
-                            self.result['pools_with_fees'] += 1
-                    except Exception as e:
-                        logging.error(f"Failed to get fees for {pool}: {str(e)}")
-
-                    # Update progress
-                    task.update(index)
-                    if index % 2 == 0 or index == len(self.pool_addresses):
-                        await self.update_progress()
+            for index, pool in enumerate(self.pool_addresses, 1):
+                try:
+                    response = requests.get(
+                        f"https://dlmm-api.meteora.ag/wallet/{self.wallet_address}/{pool}/earning",
+                        timeout=10
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    fees = float(data.get("total_fee_usd_claimed", 0.0))
+                    self.result['total_fees'] += fees
+                    if fees >= 0.01:
+                        self.result['pools_with_fees'] += 1
+                except Exception as e:
+                    logging.error(f"Failed to get fees for {pool}: {str(e)}")
+                
+                # Update progress
+                task.update(index)
+                if index % 2 == 0 or index == len(self.pool_addresses):  # Update every 2 pools or at the end
+                    await self.update_progress()
             
             task.complete()
             await self.update_progress()
@@ -666,13 +660,7 @@ class WalletProcessor:
     async def process(self):
         """Process wallet and return results"""
         logging.info(f"Processing wallet: {self.wallet_address}")
-
-        cached = await get_wallet_metrics(self.wallet_address)
-        if cached:
-            logging.info(f"Using cached data for {self.wallet_address}")
-            self.result.update(cached)
-            return self.result
-
+        
         # Process wallet in correct sequence
         await self.check_blacklist()
         await self.check_cnft()
@@ -682,9 +670,7 @@ class WalletProcessor:
         await self.calculate_activity_metrics()
         await self.extract_pool_addresses()
         await self.get_pool_fees()
-
-        await store_wallet_metrics(self.wallet_address, self.result)
-
+        
         return self.result
 
 
@@ -871,7 +857,7 @@ async def process_wallets_for_user(user_id, context):
     wallets = user_task["wallets"]
     results = []
     
-    # Process wallets concurrently
+    # Process wallets sequentially (to avoid overwhelming the APIs)
     for i, wallet in enumerate(wallets):
         user_task["current_wallet_index"] = i
         
@@ -913,15 +899,17 @@ async def process_wallets_for_user(user_id, context):
                 document=open(filename, 'rb'),
                 filename=filename
             )
+            # Clean up the file after sending
+            try:
+                os.remove(filename)
+            except:
+                pass
     
     # Send completion message
     await context.bot.send_message(
         chat_id=user_task["chat_id"],
         text=f"Analysis complete for {len(wallets)} wallet(s)!"
     )
-    
-    # Release API endpoints for this user
-    api_manager.release_user(user_id)
     
     # Clean up user task
     del user_tasks[user_id]
@@ -940,9 +928,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 def main() -> None:
     """Start the bot."""
-    # Initialize local database
-    asyncio.run(init_db())
-
     # Create the Application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
@@ -952,6 +937,10 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(start_handler, pattern="^start_analysis$"))
     application.add_handler(CallbackQueryHandler(format_handler, pattern="^format_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wallets))
+
+    # Start background task for blacklist updates
+    loop = asyncio.get_event_loop()
+    loop.create_task(periodic_blacklist_update())
 
     # Run the bot until the user presses Ctrl-C
     application.run_polling(allowed_updates=Update.ALL_TYPES)
