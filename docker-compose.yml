@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: meteora-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: meteora_bot
+      POSTGRES_USER: meteora
+      POSTGRES_PASSWORD: meteora_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - meteora-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meteora -d meteora_bot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  meteora-bot:
+    build: .
+    container_name: meteora-telegram-bot
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Telegram Bot Token
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      # Database configuration
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=meteora_bot
+      - DB_USER=meteora
+      - DB_PASSWORD=meteora_password
+    volumes:
+      # Mount API configuration files
+      - ./HELIUS_API_KEY.txt:/app/HELIUS_API_KEY.txt:ro
+      - ./RPC_URL.txt:/app/RPC_URL.txt:ro
+      # Optional: Mount logs directory
+      - ./logs:/app/logs
+    networks:
+      - meteora-network
+
+networks:
+  meteora-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
