@@ -1,7 +1,140 @@
 # Meteora Telegram Bot
 
-Telegram бот для анализа кошельков Meteora с поддержкой PostgreSQL базы данных для масштабируемости и надежности.
+# ENG
+Telegram bot for Meteora wallet analysis with PostgreSQL database.
 
+## Requirements
+
+- Docker and Docker Compose
+- Telegram Bot Token
+- Helius API keys
+- RPC URLs (QuickNode or others)
+
+## Installation
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/AlexToTheSun/meteora-wallet-metrics.git
+cd meteora-wallet-metrics
+git checkout telegram-bot-v2
+```
+
+### 2. Create configuration files
+
+#### RPC_URL.txt
+```bash
+nano RPC_URL.txt
+# Add your RPC URLs, each on a new line.
+# Example:
+# https://example-rpc-1.solana-mainnet.quiknode.pro/123456/
+# https://example-rpc-2.solana-mainnet.quiknode.pro/789012/
+```
+
+#### HELIUS_API_KEY.txt
+```bash
+nano HELIUS_API_KEY.txt
+# Add your Helius API keys, each on a new line
+# Example:
+# 87cv87sd-2h59-0v0c-2389-90cvb987987g
+# 12ab34cd-5e67-8f90-1234-56789abcdef0
+```
+
+#### .env file
+```bash
+nano .env
+# Add your Telegram Bot Token
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+```
+
+### 3. Launch with Docker Compose
+
+```bash
+#Assembly and launch
+docker-compose up -d --build
+
+# View logs
+docker-compose logs -f meteora-bot
+
+# Stop
+docker-compose down
+
+# Stop with data deletion
+docker-compose down -v
+```
+
+## Project structure
+
+```
+meteora-wallet-metrics/
+├── docker-compose.yml    # Docker Compose Configuration with PostgreSQL
+├── Dockerfile           # Image for bot
+├── meteora.py          # Bot's main code
+├── requirements.txt    # Dependencies
+├── HELIUS_API_KEY.txt # API ключи Helius
+├── RPC_URL.txt        # RPC URLs
+├── .env              # Environment variables
+└── logs/            # Directory for logs
+```
+
+
+
+## Database
+
+PostgreSQL database includes:
+- Table `blacklist` - blacklist of addresses
+- Table `api_usage` - API usage tracking
+- Table `processing_tasks` - task processing status
+
+## Monitoring
+
+### View bot logs
+```bash
+docker-compose logs -f meteora-bot
+```
+
+### Connecting to a database
+```bash
+docker-compose exec postgres psql -U meteora -d meteora_bot
+```
+
+### Useful SQL Queries
+```sql
+-- Checking the blacklist
+SELECT COUNT(*) FROM blacklist;
+
+-- View API usage
+SELECT user_id, api_type, COUNT(*) as usage_count 
+FROM api_usage 
+GROUP BY user_id, api_type;
+
+--Clearing old records
+DELETE FROM api_usage WHERE used_at < NOW() - INTERVAL '7 days';
+```
+
+## Update
+
+```bash
+# Stop the current version
+docker-compose down
+
+# Get updates
+git pull
+
+# Rebuild and run
+docker-compose up -d --build
+```
+
+## Support
+
+- Discord: alexturetskiy
+- Telegram: https://t.me/AlexTuretskiy
+- Telegram channel: https://t.me/meteora_wallet_metrics
+- Twitter: https://twitter.com/Alex007hi
+
+
+# RU
+Telegram бот для анализа кошельков Meteora с поддержкой PostgreSQL базы данных.
 
 ## Требования
 
@@ -127,9 +260,9 @@ docker-compose up -d --build
 
 ## Поддержка
 
-Discord: alexturetskiy
-Telegram: https://t.me/AlexTuretskiy
-Telegram channel: https://t.me/meteora_wallet_metrics
-Twitter: https://twitter.com/Alex007hi
+- Discord: alexturetskiy
+- Telegram: https://t.me/AlexTuretskiy
+- Telegram channel: https://t.me/meteora_wallet_metrics
+- Twitter: https://twitter.com/Alex007hi
 
 
