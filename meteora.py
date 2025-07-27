@@ -153,36 +153,89 @@ class DatabaseManager:
             response = requests.get(BLACKLIST_URL, timeout=30)
             response.raise_for_status()
             
-            # Parse CSV content
+            # Parse CSV content with custom settings to handle spaces after commas
             csv_content = response.text.splitlines()
-            reader = csv.DictReader(csv_content)
+            # Use skipinitialspace=True to handle spaces after commas
+            reader = csv.DictReader(csv_content, skipinitialspace=True)
             
             with self.get_connection() as conn:
                 with conn.cursor() as cur:
                     # Clear existing blacklist
                     cur.execute("TRUNCATE TABLE blacklist")
                     
-                    # Insert new data
+                    # Insert new data with ON CONFLICT handling for duplicates
+                    count = 0
+                    duplicates = 0
+                    seen_addresses = set()
+                    
                     for row in reader:
-                        cur.execute(
-                            "INSERT INTO blacklist (address, reason) VALUES (%s, %s)",
-                            (row['address'].strip(), row.get('reason', '').strip())
-                        )
+                        # Debug first few rows
+                        if count < 3:
+                            logger.debug(f"Processing row: {row}")
+                        
+                        # Ensure we have the 'address' field
+                        if 'address' in row and row['address']:
+                            address = row['address'].strip()
+                            reason = row.get('reason', '').strip() if 'reason' in row else ''
+                            
+                            # Skip if we've already seen this address
+                            if address in seen_addresses:
+                                duplicates += 1
+                                logger.debug(f"Skipping duplicate address: {address}")
+                                continue
+                            
+                            seen_addresses.add(address)
+                            
+                            # Additional validation - Solana addresses are typically 32-44 characters
+                            if len(address) >= 32 and len(address) <= 44:
+                                cur.execute(
+                                    """INSERT INTO blacklist (address, reason) 
+                                       VALUES (%s, %s) 
+                                       ON CONFLICT (address) DO UPDATE 
+                                       SET reason = EXCLUDED.reason, 
+                                           updated_at = CURRENT_TIMESTAMP""",
+                                    (address, reason)
+                                )
+                                count += 1
+                            else:
+                                logger.warning(f"Skipping invalid address: {address}")
                     
                     conn.commit()
-                    logger.info("Blacklist updated successfully")
+                    logger.info(f"Blacklist updated successfully with {count} unique addresses ({duplicates} duplicates skipped)")
+                    
+                    # Verify by checking a known address
+                    cur.execute(
+                        "SELECT EXISTS(SELECT 1 FROM blacklist WHERE address = %s)",
+                        ('DefcyKc4yAjRsCLZjdxWuSUzVohXtLna9g22y3pBCm2z',)
+                    )
+                    if cur.fetchone()[0]:
+                        logger.info("Verification passed: Known address found in blacklist")
+                    else:
+                        logger.warning("Verification failed: Known address NOT found in blacklist")
+                        
         except Exception as e:
             logger.error(f"Failed to update blacklist: {str(e)}")
+            logger.error(f"Error details: {type(e).__name__}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
     
     def is_blacklisted(self, address):
         """Check if address is blacklisted"""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
+                # Check exact match (case-sensitive as Solana addresses are case-sensitive)
                 cur.execute(
                     "SELECT EXISTS(SELECT 1 FROM blacklist WHERE address = %s)",
-                    (address,)
+                    (address.strip(),)
                 )
-                return cur.fetchone()[0]
+                result = cur.fetchone()[0]
+                
+                if result:
+                    logger.info(f"Address {address} found in blacklist")
+                else:
+                    logger.debug(f"Address {address} not found in blacklist")
+                    
+                return result
     
     def get_user_api_indices(self, user_id):
         """Get least recently used API indices for user"""
@@ -230,13 +283,22 @@ class DatabaseManager:
 # Initialize database
 db_manager = DatabaseManager()
 
-# Update blacklist on startup
+# Force update blacklist on startup
+logger.info("Updating blacklist on startup...")
 db_manager.update_blacklist()
+
+# Check blacklist count
+with db_manager.get_connection() as conn:
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM blacklist")
+        count = cur.fetchone()[0]
+        logger.info(f"Blacklist loaded with {count} addresses")
 
 # Schedule periodic blacklist updates (every 6 hours)
 async def periodic_blacklist_update():
     while True:
         await asyncio.sleep(6 * 60 * 60)  # 6 hours
+        logger.info("Running periodic blacklist update...")
         db_manager.update_blacklist()
 
 # API endpoint management
